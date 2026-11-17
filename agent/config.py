@@ -77,6 +77,10 @@ GEMINI_THINKING_LEVEL = os.environ.get("SH_GEMINI_THINKING_LEVEL", "").strip().l
 MAX_LLM_STEPS = _int("SH_MAX_LLM_STEPS", 15)       # LLM calls per investigation
 MAX_FIX_ATTEMPTS = _int("SH_MAX_FIX_ATTEMPTS", 2)  # actions tried per incident
 MAX_UPSTREAM_HOPS = _int("SH_MAX_UPSTREAM_HOPS", 1)
+# When several jobs of a run fail, the LLM also sees the end of the other
+# failed jobs' logs, so one fix can cover every cause (PROJECT_LOG 3.38).
+MAX_OTHER_JOBS = _int("SH_MAX_OTHER_JOBS", 3)
+OTHER_JOB_TAIL_LINES = _int("SH_OTHER_JOB_TAIL_LINES", 150)
 
 # --- Guardrail ---------------------------------------------------------------
 MAX_EDIT_FILES = _int("SH_MAX_EDIT_FILES", 5)

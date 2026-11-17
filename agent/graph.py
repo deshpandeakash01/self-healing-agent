@@ -88,6 +88,8 @@ class State(TypedDict, total=False):
     memory_hits: int             # earlier fixes shown to the LLM in the last attempt
     tool_trace: list             # the LLM's tool calls in this attempt, per step
     incident: dict               # run, job and job name first reported (kept on retry)
+    other_jobs: list             # names of the other failed jobs of the same run
+    other_jobs_log: str          # the end of their logs, appended for the LLM
     nudged: bool
     proposal: dict | None
     previous: dict | None        # what was tried last time, for a retry
@@ -291,14 +293,40 @@ class Agent:
                                    "head_sha": out["head_sha"]}
             self._say(f"[ingest] job {state['job_id']} "
                       f"({out['job_name']}): {len(raw):,} characters of log")
+            out.update(self._other_failed_jobs(job["run_id"], state["job_id"]))
         # Tools read the log, and read files at the fix branch once one exists
-        # (so a retry sees the first attempt's changes).
-        self.ctx.log_lines = log_to_lines(raw)
+        # (so a retry sees the first attempt's changes). The other failed jobs'
+        # log ends are appended, so search_log and read_log_lines reach them.
+        self.ctx.log_lines = log_to_lines(raw + out.get("other_jobs_log", ""))
         self.ctx.ref = (state.get("fix_branch") or out.get("head_sha")
                         or state.get("head_sha"))
         self.ctx.files_read_full = set()
         self.ctx.proposal = None
         return out
+
+    def _other_failed_jobs(self, run_id, job_id) -> dict:
+        """
+        The other jobs of the same run that failed too. Real CI often fails in
+        several jobs at once for DIFFERENT reasons (lint and tests, say); a fix
+        that only looks at one of them leaves the run red. The classifier still
+        sees only the main job; the LLM gets the end of each other log.
+        """
+        try:
+            others = [j for j in self.gh.failed_jobs(run_id) if j["id"] != job_id]
+        except GitHubError:
+            return {"other_jobs": [], "other_jobs_log": ""}
+        names, parts = [], []
+        for j in others[:config.MAX_OTHER_JOBS]:
+            try:
+                tail = self.gh.get_job_log(j["id"]).splitlines()[-config.OTHER_JOB_TAIL_LINES:]
+            except GitHubError:
+                continue
+            names.append(j.get("name") or str(j["id"]))
+            parts.append(f"\n===== ALSO FAILED IN THIS RUN: job {names[-1]!r} "
+                         f"(last {len(tail)} lines of its log) =====\n" + "\n".join(tail))
+        if names:
+            self._say(f"[ingest] also failed in this run: {', '.join(names)}")
+        return {"other_jobs": names, "other_jobs_log": "".join(parts)}
 
     def triage_node(self, state: State) -> dict:
         """Cheap first opinion from the classifier (feature 1)."""
@@ -382,6 +410,13 @@ class Agent:
             "(use search_log / read_log_lines to look anywhere in it)",
             "",
         ]
+        if state.get("other_jobs"):
+            lines[-1:-1] = [
+                "Other jobs that ALSO FAILED in this run: "
+                + ", ".join(state["other_jobs"]) + ". The end of each of their logs "
+                "is appended after the main log (search for 'ALSO FAILED'). They may "
+                "fail for DIFFERENT reasons. A fix must make every failed job pass, "
+                "so cover every cause you find in ONE proposal."]
         if self.mode == "llm_only":
             lines.append("No classifier hint is available for this failure.")
         elif state["label"] == "unknown":

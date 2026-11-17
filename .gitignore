@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+# records the agent writes while it runs
+data/*.jsonl

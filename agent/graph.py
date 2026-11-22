@@ -626,15 +626,22 @@ class Agent:
                                            "title": title, "files": files},
                                   "diff": "\n".join(diffs)}
                     else:
-                        if not state.get("fix_branch"):
+                        new_branch = not state.get("fix_branch")
+                        if new_branch:
                             if self.gh.branch_sha(branch):      # name already taken
                                 branch += f"-{int(time.time())}"
-                            self.gh.create_branch(branch, state["head_sha"])
-                        sha = None
-                        for e in edits:
-                            sha = self.gh.put_file(
-                                e["path"], e["content"], branch,
-                                f"self-heal: update {e['path']}")
+                            parent = state["head_sha"]          # the failing commit
+                        else:
+                            parent = self.gh.branch_sha(branch)  # the earlier fix
+                        # One commit with every file, and the branch created
+                        # AT that commit: CI runs once, on the whole fix.
+                        paths = [e["path"] for e in edits]
+                        sha = self.gh.commit_files(
+                            branch, parent, [(e["path"], e["content"]) for e in edits],
+                            f"self-heal: fix {', '.join(paths)}"
+                            + (f" (attempt {state.get('attempt', 0) + 1})"
+                               if not new_branch else ""),
+                            create_branch=new_branch)
                         pr = state.get("pr")
                         if pr:
                             # The description was written for the first fix.

@@ -189,6 +189,41 @@ class GitHubClient:
         self._request("POST", "/git/refs",
                       json={"ref": f"refs/heads/{branch}", "sha": from_sha})
 
+    def commit_files(self, branch: str, parent_sha: str, files: list[tuple[str, str]],
+                     message: str, create_branch: bool) -> str:
+        """
+        Commit several files as ONE commit on top of `parent_sha`, then point
+        `branch` at it (creating the branch if asked). Returns the commit sha.
+
+        Why not create_branch + put_file: that pushes the branch first, at the
+        still-broken commit (CI runs once on broken code), then one commit per
+        file (CI runs on every half-fixed state). Here GitHub sees a single
+        push of a single commit that contains the whole fix (PROJECT_LOG 3.41).
+        Files keep their mode (an executable stays executable).
+        """
+        self._require_write("commit files")
+        parent = self._request("GET", f"/git/commits/{parent_sha}")
+        base_tree = parent["tree"]["sha"]
+        modes = {}
+        tree = self._request("GET", f"/git/trees/{base_tree}", params={"recursive": "1"})
+        for entry in tree.get("tree", []):
+            if entry.get("type") == "blob":
+                modes[entry["path"]] = entry.get("mode", "100644")
+        new_tree = self._request("POST", "/git/trees", json={
+            "base_tree": base_tree,
+            "tree": [{"path": path.lstrip("/"), "mode": modes.get(path.lstrip("/"), "100644"),
+                      "type": "blob", "content": text} for path, text in files],
+        })
+        commit = self._request("POST", "/git/commits", json={
+            "message": message, "tree": new_tree["sha"], "parents": [parent_sha]})
+        if create_branch:
+            self._request("POST", "/git/refs",
+                          json={"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
+        else:   # never force: if the branch moved meanwhile, fail rather than overwrite
+            self._request("PATCH", f"/git/refs/heads/{branch}",
+                          json={"sha": commit["sha"], "force": False})
+        return commit["sha"]
+
     def put_file(self, path: str, text: str, branch: str, message: str) -> str:
         """Create or update one file on a branch. Returns the new commit sha."""
         self._require_write("commit file")

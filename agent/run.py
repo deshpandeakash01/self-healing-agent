@@ -224,6 +224,13 @@ def main(argv=None) -> int:
     diffs = [d for d in diffs if d]
     if diffs:
         print("change     :\n" + "\n".join(diffs))
+    evidence = [ev for a in attempts for ev in (a.get("action_result") or {}).get("evidence") or []]
+    if evidence:
+        print("backed by  :")
+        for ev in evidence:
+            what = (f"log lines {ev['log_lines']}" if ev["evidence"] == "log"
+                    else "CODE ONLY - check first")
+            print(f"  {ev['path']}: {what}" + (f"  ({ev['note']})" if ev.get("note") else ""))
     if state.get("pr"):
         print(f"pull request: {state['pr'].get('url')}")
     tokens = (f"  ({state['llm_tokens_in']:,} tokens in, {state.get('llm_tokens_out', 0):,} out)"

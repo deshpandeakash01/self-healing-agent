@@ -126,6 +126,14 @@ Rules
                reviews the pull request before merging.
     escalate - a human must handle it. Say exactly why and what you found.
 - Make the smallest change that fixes the root cause. Do not refactor.
+- An early failure can hide later ones (a broken install stops lint and
+  tests from running). You MAY also fix real faults you find by reading the
+  code that would make the next CI step fail, but only clear faults, not
+  style or taste. For EVERY file edit say what backs it: evidence "log"
+  with the log line numbers that show the problem, or evidence "code" when
+  no log line shows it. "log" claims are checked; never claim the log shows
+  something it does not. Changes backed only by code are listed separately
+  in the pull request so the reviewer checks them first.
 - Never delete, skip or weaken a test to make it pass. Never edit CI workflow
   files (.github/) or anything holding secrets; such edits are rejected.
 - If you are not sure of the cause or the fix, escalate. A wrong fix is worse
@@ -135,6 +143,38 @@ Rules
 Categories (choose the ROOT CAUSE, not the last line of the log)
 {categories}
 """
+
+
+def _evidence_lines(edits: list, evidence: list | None) -> list[str]:
+    """
+    The "what backs each change" part of a PR description or retry comment.
+    Changes no log line points at are listed separately, so the reviewer
+    checks them first (log 3.44).
+    """
+    by_path = {ev["path"]: ev for ev in evidence or []}
+    backed, unbacked = [], []
+    for e in edits:
+        ev = by_path.get(e["path"]) or {"evidence": "code", "why": "", "note": "",
+                                         "log_lines": ""}
+        why = f" \u2014 {ev['why']}" if ev.get("why") else ""
+        if ev["evidence"] == "log":
+            backed.append(f"- `{e['path']}` (log lines {ev['log_lines']}){why}")
+        else:
+            note = f" _(The agent {ev['note']}.)_" if ev.get("note") else ""
+            unbacked.append(f"- `{e['path']}`{why}{note}")
+    out = [""]
+    if backed:
+        out += ["**Changes backed by the CI log**"] + backed + [""]
+    if unbacked:
+        out += ["**Changes the CI log does not show \u2014 please check these first**",
+                "The agent found these by reading the code. No failing line in "
+                "this run points at them; they may be real faults hidden behind "
+                "an earlier error, or they may change behaviour that was intended."]
+        out += unbacked
+        if not backed:
+            out += ["", "_None of the changes in this commit is tied to a line of "
+                        "the CI log._"]
+    return out
 
 
 def _llm_error_text(error: Exception) -> str:
@@ -577,6 +617,15 @@ class Agent:
             self._say("[guardrail] BLOCKED -> escalate: " + "; ".join(decision["reasons"]))
         else:
             self._say(f"[guardrail] allowed: {decision['action']}")
+        if decision["ok"] and decision["action"] == "fix_pr":
+            # Which edits does the CI log actually back? Checked, not trusted.
+            decision["evidence"] = [guardrail.check_evidence(e, self.ctx.log_lines)
+                                    for e in proposal.get("file_edits") or []]
+            self._say("[evidence] " + "; ".join(
+                f"{ev['path']}: " + (f"log {ev['log_lines']}" if ev["evidence"] == "log"
+                                     else "code only" + (" (log claim not found)"
+                                                         if ev["note"] else ""))
+                for ev in decision["evidence"]))
         return {"decision": decision}
 
     def act(self, state: State) -> dict:
@@ -616,7 +665,10 @@ class Agent:
                         f"{config.FIX_BRANCH_PREFIX}run-{state['run_id']}"
                         f"-job-{state['job_id']}")
                     title = f"Self-heal: {_short(proposal['root_cause'])}"
-                    body = self._pr_body(state, edits)
+                    kept = {e["path"] for e in edits}
+                    evidence = [ev for ev in decision.get("evidence") or []
+                                if ev["path"] in kept]
+                    body = self._pr_body(state, edits, evidence)
                     files = [{"path": e["path"], "bytes": len(e["content"].encode("utf-8")),
                               "kind": e.get("kind", "whole_file")} for e in edits]
                     if self.dry_run:
@@ -624,7 +676,7 @@ class Agent:
                                   "plan": {"branch": branch,
                                            "base": state.get("head_branch"),
                                            "title": title, "files": files},
-                                  "diff": "\n".join(diffs)}
+                                  "diff": "\n".join(diffs), "evidence": evidence}
                     else:
                         new_branch = not state.get("fix_branch")
                         if new_branch:
@@ -647,7 +699,8 @@ class Agent:
                             # The description was written for the first fix.
                             # Say what this later commit is, for the reviewer.
                             try:
-                                self.gh.comment(pr["number"], self._retry_comment(state, edits))
+                                self.gh.comment(pr["number"],
+                                                self._retry_comment(state, edits, evidence))
                             except GitHubError:
                                 pass            # the fix itself is what matters
                         else:
@@ -657,7 +710,7 @@ class Agent:
                             pr = self.gh.open_pull_request(title, branch, base, body)
                         result = {"action": "fix_pr", "status": "done",
                                   "branch": branch, "pr": pr, "files": files,
-                                  "diff": "\n".join(diffs)}
+                                  "diff": "\n".join(diffs), "evidence": evidence}
                         out.update({"fix_branch": branch, "fix_head_sha": sha, "pr": pr})
         except (GitHubError, ReadOnlyError) as e:
             result = {"action": action, "status": "error", "error": str(e)}
@@ -690,7 +743,7 @@ class Agent:
             lines += [f"- {r}" for r in d["reasons"]]
         return "\n".join(lines)
 
-    def _retry_comment(self, state: State, edits: list) -> str:
+    def _retry_comment(self, state: State, edits: list, evidence: list | None = None) -> str:
         p, prev = state["proposal"], state.get("previous") or {}
         return "\n".join([
             f"**Self-heal, attempt {state.get('attempt', 0) + 1}.** The earlier fix "
@@ -702,11 +755,9 @@ class Agent:
             "",
             p["explanation"],
             "",
-            "**Files changed in this attempt:** "
-            + ", ".join(f"`{e['path']}`" for e in edits),
-        ])
+        ] + _evidence_lines(edits, evidence))
 
-    def _pr_body(self, state: State, edits: list) -> str:
+    def _pr_body(self, state: State, edits: list, evidence: list | None = None) -> str:
         p, t = state["proposal"], state["first_triage"]
         return "\n".join([
             "This pull request was opened automatically by the self-healing "
@@ -719,9 +770,7 @@ class Agent:
             "",
             "**Explanation**",
             p["explanation"],
-            "",
-            "**Files changed:** " + ", ".join(e["path"] for e in edits),
-        ])
+        ] + _evidence_lines(edits, evidence))
 
     def verify(self, state: State) -> dict:
         """Did it actually work? Only a passing CI run counts as healed."""
@@ -750,6 +799,8 @@ class Agent:
             "proposal": {k: p.get(k) for k in
                          ("source", "category", "action", "root_cause", "explanation")},
             "edit_paths": [e.get("path") for e in p.get("file_edits") or []],
+            # per edit: backed by the log (checked) or found in the code only
+            "evidence": result.get("evidence") or [],
             "guardrail": {k: state["decision"][k] for k in ("ok", "action", "reasons")},
             "action_result": result,
             "verify": v,

@@ -14,6 +14,8 @@ RULE
 
 from __future__ import annotations
 
+import re
+
 from . import config
 from .playbooks import ACTIONS, CATEGORIES, allowed_actions
 
@@ -191,3 +193,87 @@ def check(proposal: dict, *, attempt: int, reruns_done: int, online: bool,
         return {"action": "escalate", "ok": False, "reasons": reasons, "edits": []}
     return {"action": action, "ok": True, "reasons": [],
             "edits": edits if action == "fix_pr" else []}
+
+
+# --- Evidence: which changes does the CI log actually back? (log 3.44) ------
+#
+# The agent may fix problems it finds by reading the code, even when no log
+# line shows them yet (the gauntlet, 3.43). That is allowed, but a reviewer
+# must be able to tell those changes apart. So every edit says what backs it,
+# and a claim of "the log shows this" is CHECKED here: the cited log lines
+# must mention the file or the text being replaced. A claim that fails the
+# check is not rejected (that would block a good fix over a wrong line
+# number); it is downgraded to "found by reading the code" and the PR says so.
+
+_STOPWORDS = {
+    "import", "from", "return", "assert", "self", "true", "false", "none",
+    "print", "class", "with", "else", "elif", "pass", "raise", "async",
+    "await", "lambda", "yield", "while", "error", "test", "tests",
+}
+_LOG_WINDOW = 1            # a cited line may be off by this many lines
+_MAX_CITED_LINES = 120
+
+
+def parse_line_spec(spec: str, total: int) -> list[int]:
+    """'129-131, 284' -> [129, 130, 131, 284], kept within 1..total."""
+    lines: list[int] = []
+    for a, b, single in re.findall(r"(\d+)\s*(?:-|–|to)\s*(\d+)|(\d+)", spec or ""):
+        lo, hi = (int(a), int(b)) if a else (int(single), int(single))
+        if hi < lo:
+            lo, hi = hi, lo
+        hi = min(hi, lo + 29)                     # one range: at most 30 lines
+        lines += [n for n in range(lo, hi + 1) if 1 <= n <= total]
+        if len(lines) >= _MAX_CITED_LINES:
+            break
+    return sorted(set(lines))[:_MAX_CITED_LINES]
+
+
+def _edit_tokens(path: str, replacements: list) -> set[str]:
+    """Words a log line about this edit would be expected to contain."""
+    name = path.rsplit("/", 1)[-1].lower()
+    tokens = {name}
+    stem = name.rsplit(".", 1)[0]
+    if len(stem) >= 3 and stem not in _STOPWORDS:
+        tokens.add(stem)
+    for r in replacements or []:
+        for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{3,}", str((r or {}).get("old") or "")):
+            if w.lower() not in _STOPWORDS:
+                tokens.add(w.lower())
+    return tokens
+
+
+def check_evidence(edit: dict, log_lines: list[str]) -> dict:
+    """
+    edit      : one proposed file edit, with the optional fields
+                "evidence" ("log" or "code"), "log_lines" (e.g. "129-131")
+                and "why" (one sentence)
+    log_lines : the log the LLM was given (main job + other failed jobs)
+
+    Returns {"path", "evidence", "log_lines", "why", "note"}. "evidence" is
+    "log" only when the cited lines really mention the file or the replaced
+    text; anything else is "code" (shown to the reviewer as not backed by
+    the log). "note" explains a downgrade.
+    """
+    path = normalise_path(edit.get("path", "")) or str(edit.get("path", ""))
+    claimed = str(edit.get("evidence") or "code").strip().lower()
+    spec = str(edit.get("log_lines") or "").strip()
+    out = {"path": path, "evidence": "code", "log_lines": "",
+           "why": str(edit.get("why") or "").strip(), "note": ""}
+    if claimed != "log":
+        return out
+    cited = parse_line_spec(spec, len(log_lines))
+    if not cited:
+        out["note"] = (f"claimed log evidence, but cited no valid log line "
+                       f"({spec or 'none given'})")
+        return out
+    window = sorted({n for c in cited
+                     for n in range(c - _LOG_WINDOW, c + _LOG_WINDOW + 1)
+                     if 1 <= n <= len(log_lines)})
+    text = "\n".join(log_lines[n - 1] for n in window).lower()
+    tokens = _edit_tokens(path, edit.get("replacements") or [])
+    if any(t in text for t in tokens):
+        out.update(evidence="log", log_lines=spec)
+    else:
+        out["note"] = (f"cited log lines {spec}, but they do not mention "
+                       f"{path} or the text being changed")
+    return out

@@ -71,6 +71,19 @@ class FileEdit(BaseModel):
         default="",
         description="Only for a NEW file, or a small file you read completely: "
                     "the COMPLETE new content of the file.")
+    evidence: Literal["log", "code"] = Field(
+        default="code",
+        description="What backs this change. 'log': a line of the CI log shows "
+                    "the problem this edit fixes (give log_lines). 'code': you "
+                    "found it by reading the repository and no log line shows "
+                    "it. Be honest: 'log' claims are checked against the log.")
+    log_lines: str = Field(
+        default="",
+        description="For evidence='log': the log line numbers that show the "
+                    "problem, e.g. '129-131' or '57, 212'.")
+    why: str = Field(
+        default="",
+        description="One sentence: what is wrong in this file and how you know.")
 
 
 def _cap(text: str, limit: int | None = None) -> str:
@@ -200,6 +213,8 @@ def make_tools(ctx: Context) -> list:
         file_edits  : for fix_pr only; one item per file. For an existing
                       file give 'replacements' (exact old text -> new text).
                       For a new file give 'content' (the complete file).
+                      Every edit also says what backs it: evidence 'log'
+                      (with log_lines) or 'code', and a one-sentence 'why'.
         """
         edits = [e.model_dump() if isinstance(e, BaseModel) else dict(e)
                  for e in (file_edits or [])]

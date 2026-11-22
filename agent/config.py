@@ -65,7 +65,14 @@ MODES = ("cascade", "llm_only", "classifier_only")
 # --- LLM ---------------------------------------------------------------------
 # Kept as a setting because Google's model list changes often. Check
 # https://ai.google.dev/gemini-api/docs/models for current names.
-GEMINI_MODEL = os.environ.get("SH_GEMINI_MODEL", "gemini-4-hydrogen")
+# "or": an empty variable (as a workflow passes an unset value) means the default.
+GEMINI_MODEL = os.environ.get("SH_GEMINI_MODEL") or "gemini-4-hydrogen"
+# Tried when the main model stays unavailable (503 after the retries, or its
+# daily quota used up). Each model has its own load and its own free quota.
+# "none" switches it off. (PROJECT_LOG 3.42)
+GEMINI_FALLBACK_MODEL = os.environ.get("SH_GEMINI_FALLBACK_MODEL") or "gemini-3.5-flash"
+if GEMINI_FALLBACK_MODEL.lower() == "none":
+    GEMINI_FALLBACK_MODEL = ""
 
 # How hard the model thinks before answering: "low", "medium", "high" or
 # "xhigh" on Gemini 4. Empty = do not send the setting, so the model uses its
